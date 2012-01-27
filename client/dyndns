@@ -1,0 +1,100 @@
+#!/usr/bin/perl 
+
+#eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+#    if 0; # not running under some shell
+# $Id: dyndns,v 1.19 2003/08/23 21:56:03 carol Exp $
+
+use strict;
+
+use HTTP::Request::Common qw(POST);
+use LWP::UserAgent;
+use Sysadmin qw(safe_backticks parseRC storeRC);
+use DBI;
+
+use Net::SMTP;
+use LWP::Simple;
+
+my $html = get( 'http://checkip.dyndns.org' );
+$html =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/;
+
+         my $a = "$1";
+         my $b = "$2";
+         my $c = "$3";
+         my $d = "$4";
+        # my $ip = "$a.$b.$c.$d";
+
+
+
+my $STATUS_FILE = '/var/lib/dyndns.status';
+
+my ($status, $lang) = @ARGV;
+$status = 0 if (! defined($status));
+$lang = "en" if (! defined($lang));
+
+$ENV{LC_MESSAGES} = 'en';
+
+# Parse configuration
+my $CONF = parseRC('/etc/dyndns.conf');
+exit 0 if ! $CONF->{general}{active};
+
+# Get IP
+my $ip = "$a.$b.$c.$d";
+
+# Get previous IP from /var/lib/dyndns.status
+my $status;
+eval { $status = parseRC($STATUS_FILE) };
+my $previous = $status->{general}{ip};
+
+# If status file is less than an hour old and the IP hasn't changed, no need to
+# do DNS queries. Exit immediately.
+my $age = -M $STATUS_FILE;
+if ( defined $age and $age < 1/24 and $previous eq $ip ) {
+    exit 0;
+}
+
+my $failed = 0;
+my $ua;
+foreach my $hostname ( split /,\s*/, $CONF->{general}{host} ) {
+    foreach my $server ( keys %{ $CONF->{groups} } ) {
+        foreach my $record ( split /,/, $CONF->{groups}{$server}{records} ) {
+
+            # Check if IP needs to be communicated
+            my $dig = safe_backticks("/usr/bin/dig \@$server $hostname $record +noall +answer +tries=2 +time=3");
+            # Get first IP returned from dig
+            $dig = (join("", grep { /^\s*$hostname/ }
+                split(/\n/, $dig)) =~ /\d+\.\d+\.\d+\.\d+/g)[0];
+            if ( $dig ne $ip ) {
+                # Communicate IP
+                $ua ||= new LWP::UserAgent(timeout => 5);
+                my $req = POST $CONF->{groups}{$server}{admin_cgi},
+                  [
+                    ip       => $ip,
+                    host     => $hostname,
+                    password => $CONF->{general}{password},
+                    record   => $record
+                  ];
+                my $resp = $ua->request($req);
+                if ($resp->is_success) {
+                    if ($lang eq "en") {
+                        print "IP $ip for host $hostname has been updated on" .
+                            " $server for record type $record\n";
+                    } else {
+                        print"L'IP $ip de l'hôte $hostname a été mis à jour" .
+                            " sur le serveur $server pour le type de champ" .
+                            " $record\n";
+                    }
+                } else {
+                    if ($lang eq "en") {
+                        print "Updating IP on host $server has failed:\n\t",
+                            $resp->status_line, "\n";
+                    } else {
+                        print "L'update de l'IP sur le serveur $server a" .
+                              " échoué:\n\t", $resp->status_line, "\n";
+                    }
+                }
+            }
+        }
+    }
+}
+
+storeRC( { ip => $ip }, $STATUS_FILE ) unless $failed;
